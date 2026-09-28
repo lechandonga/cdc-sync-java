@@ -15,6 +15,9 @@ public interface LocalTargetStore {
     /** 初始化目标端（空库时写入第一个 schema 版本）。 */
     void initialize(TableSchema initialSchema);
 
+    /** 是否已完成初始 schema 写入（WAL 中存在 I 记录；崩溃后由 WAL 恢复判定）。 */
+    boolean isInitialized();
+
     /**
      * 登记一次结构演进，产生新的 schema 版本。
      * 不兼容时抛出带 RejectReason 的异常，且不得改变已有数据。

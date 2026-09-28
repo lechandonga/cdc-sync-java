@@ -27,6 +27,12 @@ public enum RejectReason {
     SNAPSHOT_FAILURE,
     /** 全量重建尚未开始或状态非法。 */
     REBUILD_NOT_ACTIVE,
+    /** 快照初始化在完成前被中断（崩溃/进程终止），现场可安全续跑。 */
+    INITIALIZATION_INTERRUPTED,
+    /** 启动时现场状态对不上（初始化标记与目标库/checkpoint 矛盾），拒绝启动以免污染已有数据。 */
+    INIT_STATE_MISMATCH,
+    /** 目标端发生不可恢复的写入失败（区别于 QUEUE_FULL 这类可恢复限流）。 */
+    UNRECOVERABLE_TARGET_FAILURE,
     /** 其它非法状态。 */
     ILLEGAL_STATE
 }

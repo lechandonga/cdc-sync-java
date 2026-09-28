@@ -88,6 +88,16 @@ public class FileTargetStore implements LocalTargetStore {
     }
 
     @Override
+    public boolean isInitialized() {
+        lock.readLock().lock();
+        try {
+            return initialized;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    @Override
     public int registerSchemaChange(SchemaChange change) {
         lock.writeLock().lock();
         try {
