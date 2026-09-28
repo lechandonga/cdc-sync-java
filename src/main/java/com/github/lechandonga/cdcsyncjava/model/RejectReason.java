@@ -27,6 +27,14 @@ public enum RejectReason {
     SNAPSHOT_FAILURE,
     /** 全量重建尚未开始或状态非法。 */
     REBUILD_NOT_ACTIVE,
+    /** 启动时发现上一次初始化未完成（自动续跑；多次重启都不会被判为已完成）。 */
+    INITIALIZATION_INCOMPLETE,
+    /** 现场对不上：目标端没有任何数据，却存在已提交位点（位点跑到数据前面）。 */
+    STATE_CHECKPOINT_AHEAD_OF_DATA,
+    /** 现场对不上：目标端存储损坏/无法识别，拒绝启动以免污染已有数据。 */
+    TARGET_STATE_CORRUPT,
+    /** 目标端应用变更时发生不可恢复失败（区别于 QUEUE_FULL 这类可恢复的暂时背压）。 */
+    TARGET_UNRECOVERABLE,
     /** 其它非法状态。 */
     ILLEGAL_STATE
 }

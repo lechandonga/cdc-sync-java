@@ -48,6 +48,15 @@ public class SchemaRegistry {
         versions.add(v1);
     }
 
+    /** WAL 恢复专用：把隔离重放得到的全部历史版本一次性采用。 */
+    public void adoptRecoveredVersions(List<TableSchema> recovered) {
+        if (!versions.isEmpty()) {
+            throw new SyncException(RejectReason.ILLEGAL_STATE,
+                    "只能对空 registry 采用恢复版本");
+        }
+        versions.addAll(recovered);
+    }
+
     /** 当前版本。 */
     public int currentVersion() {
         return versions.get(versions.size() - 1).version();
@@ -80,6 +89,56 @@ public class SchemaRegistry {
         // 先在局部构造完成，再加入列表，保证失败时无副作用
         versions.add(next);
         return next;
+    }
+
+    /**
+     * 按源端声明的“演进后版本号”幂等登记：
+     * <ul>
+     *   <li>该版本尚未登记（expectedVersion == current+1）：正常登记；</li>
+     *   <li>该版本已经登记（初始化/重建中断后重放同一条 DDL）：若演进结果与已有版本
+     *       结构完全一致则幂等跳过、不产生双登记/版本空洞；结构不一致说明现场冲突，拒绝；</li>
+     *   <li>expectedVersion 超过 current+1：存在版本缺口，拒绝（必须严格连续登记）。</li>
+     * </ul>
+     * 返回登记 / 已存在的版本号。
+     */
+    public synchronized int registerAt(SchemaChange change, int expectedVersion) {
+        int nextVersion = currentVersion() + 1;
+        if (expectedVersion == nextVersion) {
+            return register(change).version();
+        }
+        if (expectedVersion > nextVersion) {
+            throw new SyncException(RejectReason.UNKNOWN_SCHEMA_VERSION,
+                    "schema 演进出现版本缺口：期望登记 v" + nextVersion
+                            + "，事件却声明 v" + expectedVersion + "（必须按序登记）");
+        }
+        // expectedVersion <= currentVersion：重放已登记版本，必须与历史演进结果结构一致
+        TableSchema existing = at(expectedVersion);
+        TableSchema base = expectedVersion == 1 ? existing : at(expectedVersion - 1);
+        TableSchema candidate = expectedVersion == 1 ? existing
+                : validateAndEvolve(base, change);
+        if (!sameStructure(existing, candidate)) {
+            throw new SyncException(RejectReason.TARGET_STATE_CORRUPT,
+                    "重放的结构演进与已登记的 v" + expectedVersion
+                            + " 结构冲突，拒绝污染已有 schema");
+        }
+        return expectedVersion;
+    }
+
+    /** 两个 schema 的结构（主键列 + 列名/类型/可空且顺序一致）是否相同。 */
+    private static boolean sameStructure(TableSchema a, TableSchema b) {
+        if (!a.keyColumn().equals(b.keyColumn())
+                || a.columns().size() != b.columns().size()) {
+            return false;
+        }
+        for (int i = 0; i < a.columns().size(); i++) {
+            ColumnDef x = a.columns().get(i);
+            ColumnDef y = b.columns().get(i);
+            if (!x.name().equals(y.name()) || x.type() != y.type()
+                    || x.nullable() != y.nullable()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private TableSchema validateAndEvolve(TableSchema base, SchemaChange change) {

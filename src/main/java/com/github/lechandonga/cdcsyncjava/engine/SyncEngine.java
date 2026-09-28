@@ -42,13 +42,15 @@ public class SyncEngine {
     private static final Logger log = LoggerFactory.getLogger(SyncEngine.class);
 
     private final LocalSourceDatabase source;
-    private final LocalTargetStore target;
+    private LocalTargetStore target;
     private final SyncConfig config;
     private final CheckpointStore checkpointStore;
+    private final InitProgressStore initProgressStore;
     private final SyncStats stats = new SyncStats();
 
     private final AtomicLong committed = new AtomicLong();
     private final AtomicLong requestedCatchUp = new AtomicLong(Long.MAX_VALUE);
+    private final AtomicLong readerPosition = new AtomicLong(0L);
     private volatile boolean running = false;
     private volatile boolean crashed = false;
     private volatile Throwable fatalError;
@@ -60,11 +62,26 @@ public class SyncEngine {
     /** reader 到达 catchUpTo 并正常结束后计数，杜绝 coordinator 误判终止。 */
     private CountDownLatch readerDone;
 
+    /**
+     * 测试钩子：快照阶段每应用完一行后回调；若 {@code running} 已被置为 false
+     * （例如钩子内调用 simulateCrash），快照阶段立即中断并抛出，模拟“初始化未跑完进程终止”。
+     * 生产环境保持 null，无任何行为影响。
+     */
+    public volatile Runnable snapshotRowHook;
+
+    /** 在线重建的一次性原子切换请求；协调线程在批次边界执行切换屏障。 */
+    private volatile SwitchRequest pendingSwitch;
+
+    private record SwitchRequest(com.github.lechandonga.cdcsyncjava.target.LocalTargetStore next,
+                                 long newCheckpoint, CountDownLatch finished) {
+    }
+
     public SyncEngine(LocalSourceDatabase source, LocalTargetStore target, SyncConfig config) {
         this.source = source;
         this.target = target;
         this.config = config;
         this.checkpointStore = new CheckpointStore(config.stateDirectory());
+        this.initProgressStore = new InitProgressStore(config.stateDirectory());
     }
 
     /**
@@ -84,9 +101,24 @@ public class SyncEngine {
         }
         SourcePosition checkpoint = checkpointStore.load();
         long startFrom;
-        if (target.lastAppliedCommitSeq() == 0 && checkpoint.commitSeq() == 0) {
-            startFrom = runSnapshotPhase();
+        if (initProgressStore.exists()) {
+            // 上一次初始化在快照阶段被终止：严格重开目标端（初始记录损坏即 TARGET_STATE_CORRUPT，
+            // 不静默截断），再从记录的快照高水位续跑；未完成的初始化不会被当成已完成跳过，
+            // 重复重启都从此处安全续传
+            target = target.reopenStrict();
+            long resumeHw = initProgressStore.loadHighWatermark();
+            log.info("检测到未完成的初始化标记，从快照高水位 {} 续跑", resumeHw);
+            startFrom = runSnapshotPhase(resumeHw, true);
+        } else if (checkpoint.commitSeq() > 0 && target.lastAppliedCommitSeq() == 0) {
+            // 有已提交位点、目标端却没有任何已落稳数据：现场对不上，拒绝启动
+            throw new SyncException(RejectReason.STATE_CHECKPOINT_AHEAD_OF_DATA,
+                    "checkpoint 位点 " + checkpoint.commitSeq()
+                            + " 已提交但目标端没有任何已落稳数据：已确认进度跑到数据前面，拒绝启动");
+        } else if (!target.initialized() && checkpoint.commitSeq() == 0) {
+            startFrom = runSnapshotPhase(0L, false);
         } else {
+            // 启动现场校验：位点跑到实际数据前面属于对不上，拒绝启动而不是污染数据
+            validateOnDiskState(checkpoint);
             // 重启续传：checkpoint <= 目标 WAL 位点，缺口由目标端幂等补齐
             startFrom = checkpoint.commitSeq();
             committed.set(Math.max(checkpoint.commitSeq(), target.lastAppliedCommitSeq()));
@@ -96,42 +128,85 @@ public class SyncEngine {
         runIncremental(startFrom);
     }
 
-    /** 快照阶段，返回增量起始位点（= 快照 highWatermark）。 */
-    private long runSnapshotPhase() {
-        Snapshot snapshot = source.readSnapshot(0);
+    /**
+     * 启动现场校验：checkpoint 不得超过目标端已持久化位点，目标端必须已初始化。
+     * 对不上时给出可区分原因并拒绝启动，不写任何状态。
+     */
+    private void validateOnDiskState(SourcePosition checkpoint) {
+        if (!target.initialized()) {
+            throw new SyncException(RejectReason.INITIALIZATION_INCOMPLETE,
+                    "目标端尚未初始化且无未完成初始化标记，现场无法解释；拒绝启动");
+        }
+        long targetSeq = target.lastAppliedCommitSeq();
+        if (checkpoint.commitSeq() > targetSeq) {
+            throw new SyncException(RejectReason.STATE_CHECKPOINT_AHEAD_OF_DATA,
+                    "checkpoint 位点 " + checkpoint.commitSeq()
+                            + " 超过目标端已持久化位点 " + targetSeq
+                            + "：已确认进度跑到实际未落稳的数据前面，拒绝启动");
+        }
+    }
+
+    /**
+     * 快照阶段，返回增量起始位点（= 快照 highWatermark）。
+     *
+     * @param resumeHighWatermark 续跑时传入上一次快照的高水位（复现同一快照上界）；0 表示全新快照
+     * @param resume 是否为初始化中断后的续跑
+     */
+    private long runSnapshotPhase(long resumeHighWatermark, boolean resume) {
+        // 快照上界在任何目标写入之前先落盘：再次被杀仍能从同一上界续跑，保证初始化不丢不重
+        Snapshot snapshot = source.readSnapshot(resumeHighWatermark);
         long hw = snapshot.highWatermark().commitSeq();
         int schemaVersion = snapshot.schema().version();
-        log.info("快照阶段开始：schema=v{} 行数={} highWatermark={}",
-                schemaVersion, snapshot.rows().size(), hw);
-        target.initialize(source.schemaAt(1));
-        // 把快照前的全部历史演进按序登记，目标端才能翻译携带旧版本号的快照行
+        if (!resume) {
+            initProgressStore.begin(hw);
+        }
+        log.info("快照阶段开始{}：schema=v{} 行数={} highWatermark={}",
+                resume ? "（续跑）" : "", schemaVersion, snapshot.rows().size(), hw);
+        if (!target.initialized()) {
+            target.initialize(source.schemaAt(1));
+        }
+        // 把快照前的全部历史演进按序登记，目标端才能翻译携带旧版本号的快照行；
+        // 续跑时已登记的 DDL 按版本幂等跳过（断点可能正落在某条 DDL 之后）
         for (int v = 2; v <= schemaVersion; v++) {
             com.github.lechandonga.cdcsyncjava.model.SchemaChange change =
                     source.schemaChangeTo(v);
-            target.registerSchemaChange(change);
-            stats.recordSchemaChange();
+            int registered = target.registerSchemaChangeAt(change, v);
+            if (registered == v) {
+                stats.recordSchemaChange();
+            }
         }
         for (RowData row : snapshot.rows()) {
-            applySnapshotRow(row);
+            applySnapshotRow(row, hw);
+            // 测试钩子：可在快照应用中途确定性地模拟进程终止
+            if (snapshotRowHook != null) {
+                snapshotRowHook.run();
+            }
+            if (!running) {
+                throw new SyncException(RejectReason.INITIALIZATION_INCOMPLETE,
+                        "快照阶段被中断（模拟进程终止），已写入行与初始化标记均保留在磁盘");
+            }
         }
+        // 先提交位点（数据此时已全部 fsync），再清除初始化标记
         checkpointStore.store(new SourcePosition(hw));
         committed.set(hw);
+        initProgressStore.complete();
         log.info("快照阶段完成并提交位点 highWatermark={}，切换增量", hw);
         return hw;
     }
 
-    private void applySnapshotRow(RowData row) {
+    private void applySnapshotRow(RowData row, long snapshotHighWatermark) {
         // 快照中的行可能携带旧 schemaVersion（快照前发生过 DDL），目标端按登记版本翻译
         String key = String.valueOf(
                 row.values().get(source.schemaAt(row.schemaVersion()).keyColumn()));
         ChangeEvent insert = new ChangeEvent(OpType.INSERT, key, row,
                 new SourcePosition(row.commitSeq()), row.schemaVersion());
-        ApplyOutcome outcome = target.apply(insert);
+        // 快照行按键物化幂等（非按业务 seq）：续跑时同一物理行重复落盘安全跳过
+        ApplyOutcome outcome = target.applySnapshotRow(insert, snapshotHighWatermark);
         if (outcome == ApplyOutcome.APPLIED) {
             stats.recordApplied();
         } else if (outcome == ApplyOutcome.DUPLICATE_SKIPPED) {
             stats.recordDuplicate(new SkipRecord(0, insert.position(), insert.key(),
-                    RejectReason.ALREADY_APPLIED, "快照行位点已应用（重试/重启）"));
+                    RejectReason.ALREADY_APPLIED, "快照行该键已物化（断点续跑）"));
         }
     }
 
@@ -185,7 +260,8 @@ public class SyncEngine {
                     continue;
                 }
                 ChangeBatch batch = opt.get();
-                queue.put(batch); // 背压点：BLOCK 限流 / REJECT 抛 QUEUE_FULL
+                readerPosition.set(batch.to().commitSeq());
+                queue.put(batch); // 背压点：BLOCK 持续等待（可恢复）/ REJECT 抛 QUEUE_FULL
                 from = batch.to().commitSeq();
                 readerFrom = from;
                 if (from >= requestedCatchUp.get()) {
@@ -195,6 +271,12 @@ public class SyncEngine {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (RuntimeException e) {
+            // 停止 / 崩溃打断源端等待时源端适配器会包成 RuntimeException(InterruptedException)，
+            // 这不是同步失败；只有“真的不可恢复 / 可恢复的 QUEUE_FULL”才上抛
+            boolean interruptedByStop = (e.getCause() instanceof InterruptedException) && !running;
+            if (interruptedByStop) {
+                return;
+            }
             fatalError = e;
             log.error("读取线程结束 reason={} {}",
                     e instanceof SyncException se ? se.reason() : RejectReason.ILLEGAL_STATE,
@@ -210,6 +292,10 @@ public class SyncEngine {
                 ChangeBatch batch = queue.poll(Math.max(1, config.pollTimeoutMillis()));
                 if (batch != null) {
                     processBatch(batch);
+                    // 批次边界执行在线重建的一次性原子切换（此前在途批次均已提交）
+                    if (pendingSwitch != null) {
+                        performSwitch();
+                    }
                     // 只有 reader 已正常结束、队列排空且位点达标，才允许收尾
                     if (committed.get() >= requestedCatchUp.get()
                             && readerDone.getCount() == 0 && queue.size() == 0) {
@@ -221,6 +307,11 @@ public class SyncEngine {
                 if (fatalError != null) {
                     running = false;
                     return;
+                }
+                // 在线切换不能依赖“恰好有新批次”：引擎已追平（队列空）时也要在屏障点切换
+                if (pendingSwitch != null) {
+                    performSwitch();
+                    continue;
                 }
                 // 队列暂时为空但 reader 仍在等待源端新提交时，继续轮询，绝不提前退出
                 if (readerDone.getCount() == 0 && queue.size() == 0
@@ -289,7 +380,8 @@ public class SyncEngine {
 
     private void applySchemaChange(ChangeBatch batch, ChangeBatch.SchemaChangeAt ddl) {
         try {
-            int newVersion = target.registerSchemaChange(ddl.change());
+            // 按源端声明版本幂等登记：正常运行登记新版本；崩溃/切换后整批重放时跳过已登记 DDL
+            int newVersion = target.registerSchemaChangeAt(ddl.change(), ddl.schemaVersionAfter());
             stats.recordSchemaChange();
             log.info("结构演进已登记 batchId={} 位点={} {} -> v{}", batch.batchId(),
                     ddl.position().commitSeq(), ddl.change().type(), newVersion);
@@ -343,6 +435,7 @@ public class SyncEngine {
     /** 优雅停止：停止拉取，等待已分发工作完成，run 返回。 */
     public void stop() {
         running = false;
+        failPendingSwitch();
         if (readerThread != null) {
             readerThread.interrupt();
         }
@@ -350,6 +443,14 @@ public class SyncEngine {
             coordinatorThread.interrupt();
         }
         shutdownWorkersQuietly();
+    }
+
+    private void failPendingSwitch() {
+        SwitchRequest req = pendingSwitch;
+        if (req != null) {
+            pendingSwitch = null;
+            req.finished().countDown();
+        }
     }
 
     private void shutdownWorkersQuietly() {
@@ -370,6 +471,7 @@ public class SyncEngine {
     public void simulateCrash() {
         crashed = true;
         running = false;
+        failPendingSwitch();
         if (workers != null) {
             workers.shutdownNow();
         }
@@ -387,6 +489,91 @@ public class SyncEngine {
     /** 当前已提交位点。 */
     public long committedPosition() {
         return committed.get();
+    }
+
+    /**
+     * 读取线程已从源端拉取到的位点（已确认进度绝不可能超过它，也不会超过已落稳数据）。
+     */
+    public long readerPosition() {
+        return readerPosition.get();
+    }
+
+    /** 当前内存缓冲积压批次数（背压可观测）。 */
+    public int backlogBatches() {
+        return queue == null ? 0 : queue.size();
+    }
+
+    /** 源端最新位点相对已确认位点的落后量（积压规模，随源端写入实时变化）。 */
+    public long sourceLag() {
+        return Math.max(0L, source.latestCommitSeq() - committed.get());
+    }
+
+    /** 背压命中次数：读取方因缓冲满被迫持续等待的次数。 */
+    public long backpressureWaits() {
+        return queue == null ? 0L : queue.backpressureWaits();
+    }
+
+    /** 背压累计等待毫秒数。 */
+    public long backpressureWaitMillis() {
+        return queue == null ? 0L : queue.backpressureWaitMillis();
+    }
+
+    /** 历史峰值积压批次数。 */
+    public long maxBacklogBatches() {
+        return queue == null ? 0L : queue.maxOccupancy();
+    }
+
+    /**
+     * 在线重建原子切换：请求协调线程在下一个批次边界（无在途批次、本批已提交）暂停应用、
+     * 原子替换底层目标存储并把已确认位点对齐到新库位点，然后恢复同步。
+     * 整个过程切换一次生效，读取方（经可热切换存储）只会看到完整旧库或完整新库。
+     *
+     * <p>本方法会阻塞直到切换完成；要求引擎使用 {@code SwappableTargetStore} 且采用
+     * 等待式（BLOCK）背压——REJECT 策略下切换窗口的新批次可能被拒绝，故不支持。</p>
+     */
+    public void requestOnlineSwitch(
+            com.github.lechandonga.cdcsyncjava.target.LocalTargetStore next,
+            long newCheckpoint) throws InterruptedException {
+        if (!(target instanceof com.github.lechandonga.cdcsyncjava.target.SwappableTargetStore)) {
+            throw new SyncException(RejectReason.ILLEGAL_STATE,
+                    "在线切换要求目标端为 SwappableTargetStore");
+        }
+        if (config.backpressurePolicy() != BackpressurePolicy.BLOCK) {
+            throw new SyncException(RejectReason.ILLEGAL_STATE,
+                    "在线重建切换仅支持 BLOCK 等待式背压，当前策略 "
+                            + config.backpressurePolicy());
+        }
+        CountDownLatch finished = new CountDownLatch(1);
+        pendingSwitch = new SwitchRequest(next, newCheckpoint, finished);
+        while (finished.getCount() != 0) {
+            if (fatalError != null && !crashed) {
+                throw fatalError instanceof SyncException se ? se
+                        : new SyncException(RejectReason.ILLEGAL_STATE,
+                                "切换屏障期间引擎发生不可恢复失败", fatalError);
+            }
+            Thread.sleep(2);
+        }
+    }
+
+    /** 协调线程在批次边界执行的一次性切换（无在途批次，本批数据已 fsync + checkpoint）。 */
+    private void performSwitch() {
+        SwitchRequest req = pendingSwitch;
+        if (req == null) {
+            return;
+        }
+        try {
+            ((com.github.lechandonga.cdcsyncjava.target.SwappableTargetStore) target)
+                    .swapTo(req.next());
+            // 新库位点即新的已确认上界：不回退（避免重复推进），也不越过新库已落稳数据
+            long aligned = Math.max(committed.get(), req.newCheckpoint());
+            checkpointStore.store(new SourcePosition(aligned));
+            committed.set(aligned);
+            readerFrom = Math.max(readerFrom, aligned);
+            log.info("在线重建原子切换完成：新库位点={} 已确认位点={}", req.newCheckpoint(), aligned);
+        } finally {
+            pendingSwitch = null;
+            req.finished().countDown();
+        }
     }
 
     /** 统计信息。 */
